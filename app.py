@@ -1,3 +1,4 @@
+import ipaddress
 import json
 import os
 import re
@@ -18,6 +19,9 @@ ROOTFS = os.environ.get("ROOTFS", "/rootfs")
 HOSTSYS_ROOT = os.environ.get("HOSTSYS_ROOT", "/hostsys")
 THERMAL_ROOT = os.path.join(HOSTSYS_ROOT, "class/thermal")
 NET_ROOT = os.path.join(HOSTSYS_ROOT, "class/net")
+# PID 1's netns is the host's; /proc/net inside the container only shows the container's own.
+CONNTRACK_PATH = os.path.join(ROOTFS, "proc/1/net/nf_conntrack")
+LAN_NET = ipaddress.ip_network(os.environ.get("LAN_SUBNET") or "192.168.1.0/24", strict=False)
 # class/thermal and class/net are symlink farms into devices/... , so the
 # container needs the whole host /sys tree mounted, not just these subdirs.
 
@@ -32,7 +36,7 @@ VIRTUAL_IFACE_RE = re.compile(r"^(lo|docker\d*|br-|veth|tun|tap|virbr|vnet|wg)")
 
 SAMPLE_COLUMNS = [
     "ts", "cpu", "mem", "disk", "temp", "load1", "load5", "load15",
-    "rx_bps", "tx_bps", "dio_read_bps", "dio_write_bps",
+    "rx_bps", "tx_bps", "dio_read_bps", "dio_write_bps", "lan_bps", "net_bps",
 ]
 
 db_lock = threading.Lock()
@@ -56,7 +60,7 @@ def _init_db():
         "ts INTEGER PRIMARY KEY, cpu REAL, mem REAL, disk REAL, temp REAL, "
         "load1 REAL, load5 REAL, load15 REAL)"
     )
-    for col in ("rx_bps", "tx_bps", "dio_read_bps", "dio_write_bps"):
+    for col in ("rx_bps", "tx_bps", "dio_read_bps", "dio_write_bps", "lan_bps", "net_bps"):
         try:
             conn.execute(f"ALTER TABLE samples ADD COLUMN {col} REAL")
         except sqlite3.OperationalError:
@@ -147,9 +151,9 @@ def read_summary(start_ts, end_ts):
     the rate metrics - computed from raw samples, not the downsampled buckets,
     so short spikes aren't smoothed away."""
     gauge_cols = ["cpu", "mem", "disk", "temp"]
-    rate_cols = ["rx_bps", "tx_bps", "dio_read_bps", "dio_write_bps"]
+    rate_cols = ["rx_bps", "tx_bps", "dio_read_bps", "dio_write_bps", "lan_bps", "net_bps"]
     select = ", ".join(f"AVG({c}), MIN({c}), MAX({c})" for c in gauge_cols)
-    select += ", " + ", ".join(f"AVG({c})" for c in rate_cols)
+    select += ", " + ", ".join(f"AVG({c}), MAX({c})" for c in rate_cols)
     with db_lock, _db as conn:
         row = conn.execute(
             f"SELECT COUNT(*), {select} FROM samples WHERE ts >= ? AND ts <= ?",
@@ -164,15 +168,21 @@ def read_summary(start_ts, end_ts):
         avg, lo, hi = row[1 + i * 3: 4 + i * 3]
         gauges[col] = {"avg": avg, "min": lo, "max": hi} if avg is not None else None
     rate_offset = 1 + len(gauge_cols) * 3
-    rx_avg, tx_avg, dread_avg, dwrite_avg = row[rate_offset:rate_offset + 4]
+    rates = {}
+    for i, col in enumerate(rate_cols):
+        rates[col] = row[rate_offset + i * 2: rate_offset + i * 2 + 2]  # (avg, max)
+
+    def totals(names):
+        return {f"{n}_total": (rates[c][0] or 0) * duration for n, c in names} | \
+               {f"{n}_max": rates[c][1] or 0 for n, c in names}
+
     return {
         "cpu": gauges["cpu"], "mem": gauges["mem"], "disk": gauges["disk"], "temp": gauges["temp"],
-        "net": {
-            "rx_total": (rx_avg or 0) * duration, "tx_total": (tx_avg or 0) * duration,
-        } if rx_avg is not None else None,
-        "dio": {
-            "read_total": (dread_avg or 0) * duration, "write_total": (dwrite_avg or 0) * duration,
-        } if dread_avg is not None else None,
+        "net": totals([("rx", "rx_bps"), ("tx", "tx_bps")]) if rates["rx_bps"][0] is not None else None,
+        "dio": totals([("read", "dio_read_bps"), ("write", "dio_write_bps")])
+        if rates["dio_read_bps"][0] is not None else None,
+        "scope": totals([("lan", "lan_bps"), ("net", "net_bps")])
+        if rates["lan_bps"][0] is not None else None,
     }
 
 
@@ -345,6 +355,64 @@ def read_dio_bps():
     return max(0.0, round(r_bps, 1)), max(0.0, round(w_bps, 1))
 
 
+CT_TUPLE_RE = re.compile(r"src=(\S+) dst=(\S+)(?: sport=(\d+) dport=(\d+))?")
+CT_BYTES_RE = re.compile(r"\bbytes=(\d+)")
+_prev_flows = None
+_prev_flows_ts = None
+
+
+def flow_scope(src, dst):
+    """'net' if either end is a public address; 'lan' if both ends are on the
+    LAN subnet; None otherwise (container<->container, loopback, or a
+    container talking to the host's own LAN IP - none of that touches the NIC)."""
+    try:
+        a, b = ipaddress.ip_address(src), ipaddress.ip_address(dst)
+    except ValueError:
+        return None
+    if any(ip.is_global and not ip.is_multicast for ip in (a, b)):
+        return "net"
+    if a in LAN_NET and b in LAN_NET:
+        return "lan"
+    return None
+
+
+def read_scope_bps():
+    """(lan_bps, net_bps) from per-flow byte deltas in the host conntrack table.
+    Needs net.netfilter.nf_conntrack_acct=1 on the host - without it conntrack
+    keeps no byte counters, and this returns (None, None)."""
+    global _prev_flows, _prev_flows_ts
+    now = time.time()
+    try:
+        with open(CONNTRACK_PATH) as f:
+            lines = f.readlines()
+    except OSError:
+        return None, None
+    cur = {}
+    saw_bytes = False
+    for line in lines:
+        counted = CT_BYTES_RE.findall(line)
+        if not counted:
+            continue
+        saw_bytes = True
+        m = CT_TUPLE_RE.search(line)
+        scope = flow_scope(m.group(1), m.group(2)) if m else None
+        if scope:
+            cur[(line.split(None, 3)[2],) + m.groups()] = (scope, sum(int(b) for b in counted))
+    if lines and not saw_bytes:
+        _prev_flows = None
+        return None, None
+    prev, prev_ts = _prev_flows, _prev_flows_ts
+    _prev_flows, _prev_flows_ts = cur, now
+    if prev is None or now <= prev_ts:
+        return None, None
+    delta = {"lan": 0, "net": 0}
+    for key, (scope, total) in cur.items():
+        before = prev.get(key)
+        delta[scope] += total - before[1] if before and total >= before[1] else total
+    dt = now - prev_ts
+    return round(delta["lan"] / dt, 1), round(delta["net"] / dt, 1)
+
+
 def sampler_loop():
     while True:
         try:
@@ -355,12 +423,14 @@ def sampler_loop():
             load1, load5, load15 = os.getloadavg()
             rx_bps, tx_bps = read_net_bps()
             dio_r_bps, dio_w_bps = read_dio_bps()
+            lan_bps, net_bps = read_scope_bps()
             sample = {
                 "ts": int(time.time()),
                 "cpu": cpu, "mem": mem_pct, "disk": disk_pct, "temp": temp,
                 "load1": round(load1, 2), "load5": round(load5, 2), "load15": round(load15, 2),
                 "rx_bps": rx_bps, "tx_bps": tx_bps,
                 "dio_read_bps": dio_r_bps, "dio_write_bps": dio_w_bps,
+                "lan_bps": lan_bps, "net_bps": net_bps,
             }
             sample["mem_used_mib"] = mem_used
             sample["mem_total_mib"] = mem_total
@@ -758,6 +828,11 @@ svg.chart { width: 100%; height: 90px; display: block; overflow: visible; }
   opacity: 0; transform: translate(-50%, -110%); white-space: nowrap;
 }
 .chart-wrap { position: relative; }
+.chart .peakline { stroke: var(--text-2); stroke-width: 1; stroke-dasharray: 5 4; opacity: 0.55; vector-effect: non-scaling-stroke; }
+.peak-label {
+  position: absolute; right: 4px; pointer-events: none; font-size: 0.66rem; color: var(--text-2);
+  font-variant-numeric: tabular-nums; background: var(--surface); padding: 0 4px; border-radius: 4px; opacity: 0.9;
+}
 .empty-state {
   height: 90px; display: none; align-items: center; justify-content: center; text-align: center;
   color: var(--muted); font-size: 0.75rem; line-height: 1.4; padding: 0 20px;
@@ -884,6 +959,16 @@ footer { text-align: center; color: var(--muted); font-size: 0.7rem; margin-top:
         <svg class="chart" id="chart-net" viewBox="0 0 700 90" preserveAspectRatio="none"></svg>
         <div class="tooltip" id="tip-net"></div>
         <div class="empty-state" id="empty-net"></div>
+      </div>
+    </div>
+    <div class="card chart-card">
+      <div class="chead"><span class="ctitle">Rețea · local vs internet</span><span class="cval" id="cv-scope"></span></div>
+      <div class="csummary" id="sum-scope"></div>
+      <div class="legend" id="legend-scope"></div>
+      <div class="chart-wrap">
+        <svg class="chart" id="chart-scope" viewBox="0 0 700 90" preserveAspectRatio="none"></svg>
+        <div class="tooltip" id="tip-scope"></div>
+        <div class="empty-state" id="empty-scope"></div>
       </div>
     </div>
     <div class="card chart-card">
@@ -1037,6 +1122,11 @@ const CHARTS = {
             { key: "rx_bps", color: "var(--line)", label: "Descărcare ↓" },
             { key: "tx_bps", color: "var(--line2)", label: "Încărcare ↑" },
           ] },
+  scope: { title: "Rețea · local vs internet", unit: "B/s", domain: null, fmt: fmtRate,
+          series: [
+            { key: "lan_bps", color: "var(--line)", label: "Local" },
+            { key: "net_bps", color: "var(--line2)", label: "Internet" },
+          ] },
   dio:  { title: "Disc I/O", unit: "B/s", domain: null, fmt: fmtRate,
           series: [
             { key: "dio_read_bps", color: "var(--line)", label: "Citire" },
@@ -1067,8 +1157,11 @@ function buildPath(points, w, h, minV, maxV, t0, span) {
   return { line, area, coords };
 }
 
-function emptyMessage(hist) {
+function emptyMessage(hist, name) {
   if (hist.earliest_ts === null) return "Se colectează date… revino peste câteva minute.";
+  if (name === "scope" && hist.points.length && hist.points.every(p => p.lan_bps == null)) {
+    return "Indisponibil: activează net.netfilter.nf_conntrack_acct=1 pe host (vezi README).";
+  }
   if (hist.earliest_ts > hist.range_start) {
     const d = new Date(hist.earliest_ts * 1000).toLocaleString("ro-RO", { dateStyle: "medium", timeStyle: "short" });
     return `Istoricul disponibil începe la ${d}.`;
@@ -1083,10 +1176,22 @@ function renderSummary(name, cfg, hist) {
   if ("avg" in s) {
     el.textContent = `medie ${cfg.fmt(s.avg)} · min ${cfg.fmt(s.min)} · max ${cfg.fmt(s.max)} pe interval`;
   } else if (name === "net") {
-    el.textContent = `total pe interval: ↓ ${fmtBytes(s.rx_total)} · ↑ ${fmtBytes(s.tx_total)}`;
+    el.textContent = `total pe interval: ↓ ${fmtBytes(s.rx_total)} · ↑ ${fmtBytes(s.tx_total)}` +
+      ` · vârf ↓ ${fmtRate(s.rx_max)} · ↑ ${fmtRate(s.tx_max)}`;
   } else if (name === "dio") {
-    el.textContent = `total pe interval: citire ${fmtBytes(s.read_total)} · scriere ${fmtBytes(s.write_total)}`;
+    el.textContent = `total pe interval: citire ${fmtBytes(s.read_total)} · scriere ${fmtBytes(s.write_total)}` +
+      ` · vârf citire ${fmtRate(s.read_max)} · scriere ${fmtRate(s.write_max)}`;
+  } else if (name === "scope") {
+    el.textContent = `total pe interval: local ${fmtBytes(s.lan_total)} · internet ${fmtBytes(s.net_total)}` +
+      ` · vârf local ${fmtRate(s.lan_max)} · internet ${fmtRate(s.net_max)}`;
   }
+}
+
+function chartPeak(s) {
+  if (!s) return null;
+  if ("max" in s) return s.max;
+  const maxes = Object.entries(s).filter(([k]) => k.endsWith("_max")).map(([, v]) => v);
+  return maxes.length ? Math.max(...maxes) : null;
 }
 
 function renderChart(name, cfg, hist) {
@@ -1094,6 +1199,14 @@ function renderChart(name, cfg, hist) {
   const tip = document.getElementById(`tip-${name}`);
   const emptyEl = document.getElementById(`empty-${name}`);
   const w = 700, h = 90;
+  const wrap = svg.parentElement;
+  let peakLabel = wrap.querySelector(".peak-label");
+  if (!peakLabel) {
+    peakLabel = document.createElement("div");
+    peakLabel.className = "peak-label";
+    wrap.appendChild(peakLabel);
+  }
+  peakLabel.style.display = "none";
 
   renderSummary(name, cfg, hist);
 
@@ -1108,7 +1221,7 @@ function renderChart(name, cfg, hist) {
   svg.innerHTML = "";
   if (!anyUsable) {
     svg.style.display = "none";
-    emptyEl.textContent = emptyMessage(hist);
+    emptyEl.textContent = emptyMessage(hist, name);
     emptyEl.classList.add("show");
     document.getElementById(`cv-${name}`).textContent = "--";
     tip.style.opacity = 0;
@@ -1118,8 +1231,12 @@ function renderChart(name, cfg, hist) {
   emptyEl.classList.remove("show");
 
   const allVals = seriesPoints.flatMap(s => s.points.map(p => p.v));
+  const peak = chartPeak(hist.summary && hist.summary[name]);
   let [minV, maxV] = cfg.domain || [Math.min(...allVals), Math.max(...allVals)];
-  if (!cfg.domain) { const pad = (maxV - minV) * 0.15 || 1; minV -= pad; maxV += pad; }
+  if (!cfg.domain) {
+    if (peak !== null) maxV = Math.max(maxV, peak);
+    const pad = (maxV - minV) * 0.15 || 1; minV -= pad; maxV += pad;
+  }
   const t0 = hist.range_start, span = (hist.range_end - hist.range_start) || 1;
 
   const latestParts = seriesPoints.map(s => s.points.length
@@ -1134,6 +1251,18 @@ function renderChart(name, cfg, hist) {
     g.setAttribute("class", "gridline");
     g.setAttribute("x1", 0); g.setAttribute("x2", w); g.setAttribute("y1", gy); g.setAttribute("y2", gy);
     svg.appendChild(g);
+  }
+
+  if (peak !== null && peak > 0) {
+    const peakY = h - ((peak - minV) / ((maxV - minV) || 1)) * h;
+    const pl = document.createElementNS(ns, "line");
+    pl.setAttribute("class", "peakline");
+    pl.setAttribute("x1", 0); pl.setAttribute("x2", w); pl.setAttribute("y1", peakY); pl.setAttribute("y2", peakY);
+    svg.appendChild(pl);
+    peakLabel.textContent = `max ${cfg.fmt(peak)}`;
+    peakLabel.style.top = (peakY / h * 100) + "%";
+    peakLabel.style.transform = peakY / h < 0.2 ? "translateY(3px)" : "translateY(-100%)";
+    peakLabel.style.display = "";
   }
 
   const drawnSeries = [];
