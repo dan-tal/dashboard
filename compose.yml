@@ -1,0 +1,28 @@
+networks:
+  local-net:
+    external: true
+
+services:
+  dashboard:
+    build: .
+    container_name: dashboard
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - TZ=Europe/Chisinau
+      - HOST_IP=${HOST_IP}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /:/rootfs:ro
+      - /sys:/hostsys:ro
+      - ./data:/data
+    labels:
+      - traefik.enable=true
+      - traefik.http.middlewares.dashboard-lanonly.ipallowlist.sourcerange=${LAN_SUBNET},127.0.0.1/32
+      - traefik.http.routers.dashboard.rule=Host(`dashboard.home`)
+      - traefik.http.routers.dashboard.entrypoints=web
+      - traefik.http.routers.dashboard.middlewares=dashboard-lanonly
+      - traefik.http.services.dashboard.loadbalancer.server.port=5000
+    networks:
+      - local-net

@@ -1,0 +1,5 @@
+{
+  "_comment": "Copy to data/overrides.json. Manual URL overrides for containers the auto-detection can't handle (host-network containers with no Traefik label, or a router whose URL should just be hidden). A value of null hides the container's URL entirely.",
+  "some-host-network-container": "http://192.168.1.1:3000",
+  "some-internal-only-container": null
+}
