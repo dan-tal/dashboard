@@ -4,7 +4,7 @@ A single-file Flask dashboard for a homelab Docker host: live CPU / RAM / disk /
 history charts with peaks, network split into LAN vs internet traffic, per-container stats and
 auto-discovered links to your other containers.
 
-![Dashboard overview (dark)](docs/screenshots/hero-dark.png)
+![Dashboard tour: history ranges, chart tooltips and container cards](docs/screenshots/demo.gif)
 
 > The UI text is in Romanian. All screenshots use generated demo data, not a real host - see
 > [Regenerating the screenshots](#regenerating-the-screenshots).
@@ -48,9 +48,9 @@ your LAN, **red** goes through a public domain.
 The layout follows the system colour scheme and is usable on a phone; a web manifest lets you
 install it as an app.
 
-| Light | Mobile (dark) |
-| --- | --- |
-| ![Light theme](docs/screenshots/hero-light.png) | ![Mobile view](docs/screenshots/mobile-dark.png) |
+| Dark | Light | Mobile |
+| --- | --- | --- |
+| ![Dark theme](docs/screenshots/hero-dark.png) | ![Light theme](docs/screenshots/hero-light.png) | ![Mobile view](docs/screenshots/mobile-dark.png) |
 
 ## Requirements
 
@@ -116,9 +116,10 @@ instantaneous spikes.
 
 ## Regenerating the screenshots
 
-The images in `docs/screenshots/` come from [scripts/screenshots.py](scripts/screenshots.py), which
-replaces every `/api/*` response in the browser with generated demo data, so nothing from a real
-host ends up in them. With the dashboard running:
+The images and the demo GIF in `docs/screenshots/` come from
+[scripts/screenshots.py](scripts/screenshots.py), which replaces every `/api/*` response in the
+browser with generated demo data, so nothing from a real host ends up in them. With the dashboard
+running:
 
 ```
 pip install playwright pillow && playwright install chromium

@@ -7,6 +7,7 @@ Every /api/* response is replaced inside the browser with generated data, so not
 from the real host (containers, domains, addresses, metrics) ends up in the images.
 """
 import glob
+import io
 import json
 import math
 import os
@@ -25,6 +26,7 @@ OUT = sys.argv[2] if len(sys.argv) > 2 else "docs/screenshots"
 SAMPLE = 15
 UTC_OFFSET = 3 * 3600
 START = time.time()
+TODAY = int((START + UTC_OFFSET) // 86400)
 MEM_TOTAL_MIB = 16384
 DISK_TOTAL = 1000204886016
 COLS = ["ts", "cpu", "mem", "disk", "temp", "load1", "load5", "load15",
@@ -56,14 +58,20 @@ def bump(h, a, b, ramp=0.3):
 
 
 def sample(t):
-    """One fake host sample: quiet nights, a 03:00 backup, a midday download,
-    evening media streaming and one short CPU spike at ~19:40."""
-    h = ((t + UTC_OFFSET) % 86400) / 3600
-    stream = bump(h, 18.0, 23.0, 0.6) * (0.6 + 0.8 * max(0.0, wave(t, 3, 700)))
+    """One fake host sample: quiet nights, a 03:00 backup, a daily download,
+    evening media streaming (longer on weekends) and occasional CPU spikes.
+    Per-day variation keeps the 7 and 30 day views from looking stamped."""
+    local = t + UTC_OFFSET
+    day, h = int(local // 86400), (local % 86400) / 3600
+    dv, dv2 = frac(math.sin(day * 12.9898) * 43758.5453), frac(math.sin(day * 78.233 + 1) * 43758.5453)
+    weekend = 1.0 if (day + 3) % 7 >= 5 else 0.0
+    stream = bump(h, 18.0 - weekend, 23.0 + weekend, 0.6) * (0.7 + 0.6 * dv + 0.35 * weekend) \
+        * (0.6 + 0.8 * max(0.0, wave(t, 3, 700)))
     morning = bump(h, 7.0, 8.5, 0.5)
-    backup = bump(h, 2.75, 3.6, 0.1)
-    burst = bump(h, 12.3, 12.75, 0.05)
-    spike = bump(h, 19.6, 19.72, 0.02)
+    backup = bump(h, 2.75, 3.6, 0.1) * (0.8 + 0.4 * dv2)
+    b0 = 9 + dv2 * 10
+    burst = bump(h, b0, b0 + 0.45, 0.05)
+    spike = bump(h, 19.6, 19.72, 0.02) if (dv > 0.7 or day >= TODAY - 1) else 0.0
 
     cpu = 6 + 3 * wave(t, 1, 900) + 2 * jitter(t, 1) + 30 * stream + 30 * backup + 12 * burst \
         + 8 * morning + 62 * spike * (0.9 + 0.1 * jitter(t, 4))
@@ -87,8 +95,9 @@ def sample(t):
 
 
 def history(start, end):
-    first = start - start % SAMPLE + SAMPLE
-    raw = [sample(t) for t in range(first, end + 1, SAMPLE)]
+    step = SAMPLE if end - start <= 1.5 * 86400 else (end - start) // 2880 // SAMPLE * SAMPLE
+    first = start - start % step + step
+    raw = [sample(t) for t in range(first, end + 1, step)]
     bucket = max(SAMPLE, (end - start) // 300)
     groups = {}
     for s in raw:
@@ -194,7 +203,7 @@ def handle(route):
 
 # ---------------------------------------------------------------- capturing --
 
-def open_page(browser, scheme, width, height, scale, mobile=False):
+def open_page(browser, scheme, width, height, scale, mobile=False, range_min=1440):
     ctx = browser.new_context(
         viewport={"width": width, "height": height}, device_scale_factor=scale, color_scheme=scheme,
         locale="ro-RO", timezone_id="Europe/Chisinau", is_mobile=mobile, has_touch=mobile,
@@ -202,9 +211,67 @@ def open_page(browser, scheme, width, height, scale, mobile=False):
     page = ctx.new_page()
     page.route(re.compile(r".*/api/.*"), handle)
     page.goto(BASE, wait_until="load")
-    page.click('#range-toggle button[data-min="1440"]')
+    if range_min:
+        page.click(f'#range-toggle button[data-min="{range_min}"]')
     page.wait_for_timeout(6000)
     return ctx, page
+
+
+def make_gif(browser, path, width=900, height=600):
+    """Tour: top of page, every history range, tooltips following the cursor on two
+    charts, then the container cards. Frames are screenshots joined with Pillow."""
+    ctx, page = open_page(browser, "dark", width, height, 1, range_min=None)
+    frames, durations = [], []
+
+    def shot(ms):
+        frames.append(Image.open(io.BytesIO(page.screenshot())).convert("RGB"))
+        durations.append(ms)
+
+    def top_of(selector, offset):
+        return page.evaluate(f"document.querySelector('{selector}').getBoundingClientRect().top + scrollY - {offset}")
+
+    def scroll_to(y, steps):
+        y0 = page.evaluate("scrollY")
+        for i in range(1, steps + 1):
+            k = i / steps
+            page.evaluate(f"scrollTo(0, {y0 + (y - y0) * k * k * (3 - 2 * k)})")
+            page.wait_for_timeout(30)
+            shot(45)
+
+    def sweep(selector, x0, x1, steps):
+        box = page.locator(selector).bounding_box()
+        for i in range(steps + 1):
+            x = box["x"] + box["width"] * (x0 + (x1 - x0) * i / steps)
+            page.mouse.move(x, box["y"] + box["height"] / 2)
+            page.wait_for_timeout(40)
+            shot(70)
+        page.mouse.move(2, 2)
+
+    shot(1800)
+    scroll_to(top_of("#range-toggle", 70), 8)
+    shot(600)
+    for minutes in (60, 360, 1440, 10080, 43200, 1440):
+        page.click(f'#range-toggle button[data-min="{minutes}"]')
+        page.mouse.move(2, 2)
+        page.wait_for_timeout(900)
+        shot(1300)
+    sweep("#chart-cpu", 0.04, 0.95, 18)
+    shot(700)
+    scroll_to(page.evaluate("document.querySelector('#chart-net').closest('.card').getBoundingClientRect().top + scrollY - 20"), 8)
+    sweep("#chart-scope", 0.04, 0.83, 18)
+    shot(700)
+    scroll_to(top_of("#containers", 50), 8)
+    shot(2200)
+    ctx.close()
+
+    step = max(1, len(frames) // 8)
+    sheet = Image.new("RGB", (width, height * len(frames[::step])))
+    for i, f in enumerate(frames[::step]):
+        sheet.paste(f, (0, i * height))
+    palette = sheet.quantize(colors=255, method=Image.Quantize.MEDIANCUT, dither=Image.Dither.NONE)
+    paletted = [f.quantize(palette=palette, dither=Image.Dither.NONE) for f in frames]
+    paletted[0].save(path, save_all=True, append_images=paletted[1:], duration=durations, loop=0, optimize=True)
+    print(f"{os.path.basename(path)}: {len(frames)} frames, {os.path.getsize(path) // 1024} KB")
 
 
 def shrink(path):
@@ -238,6 +305,8 @@ def main():
         ctx, page = open_page(browser, "dark", 390, 844, 2, mobile=True)
         page.screenshot(path=f"{OUT}/mobile-dark.png")
         ctx.close()
+
+        make_gif(browser, f"{OUT}/demo.gif")
         browser.close()
 
     for f in sorted(glob.glob(f"{OUT}/*.png")):
